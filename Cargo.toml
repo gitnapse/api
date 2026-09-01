@@ -1,0 +1,22 @@
+[workspace]
+members = ["crates/gitnapse-protocol", "crates/gitnapse-server"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[workspace.dependencies]
+gitnapse = { path = "../gitnapse" }
+anyhow = "1.0"
+axum = "0.8"
+base64 = "0.22"
+clap = { version = "4.6", features = ["derive"] }
+dotenvy = "0.15"
+env_logger = "0.11"
+log = "0.4"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.48", features = ["rt-multi-thread", "macros", "net"] }
+tower = { version = "0.5", features = ["util"] }
