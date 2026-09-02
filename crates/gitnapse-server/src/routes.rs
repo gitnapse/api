@@ -25,11 +25,11 @@ use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use base64::Engine;
 use gitnapse_protocol::{
-    API_PREFIX, CommitListRequest, CompareRequest, ContentDto, ContentRequest, ErrorDto, HealthDto,
-    IssueCreateRequest, NumberRepoRequest, PageRequest, PrCommentRequest, PrCreateRequest,
-    PrMergeRequest, PrReviewRequest, PrUpdateRequest, RateLimitDto, RefRepoRequest,
-    ReleaseCreateRequest, ReleasesRequest, RepoCreateRequest, RepoRequest, SearchRequest,
-    StateRepoRequest, TreeRequest, UserDto, WorkflowRunsRequest,
+    API_PREFIX, AuthStatusDto, CommitListRequest, CompareRequest, ContentDto, ContentRequest,
+    ErrorDto, HealthDto, IssueCreateRequest, NumberRepoRequest, PageRequest, PrCommentRequest,
+    PrCreateRequest, PrMergeRequest, PrReviewRequest, PrUpdateRequest, RateLimitDto,
+    RefRepoRequest, ReleaseCreateRequest, ReleasesRequest, RepoCreateRequest, RepoRequest,
+    SearchRequest, StateRepoRequest, TokenSetRequest, TreeRequest, UserDto, WorkflowRunsRequest,
 };
 use std::sync::Arc;
 use std::time::Duration;
@@ -77,6 +77,12 @@ pub fn router(backend: Arc<dyn Backend>, api_token: Option<String>) -> Router {
         .route("/api/v1/user", get(user))
         .route("/api/v1/user/starred", get(user_starred))
         .route("/api/v1/rate-limit", get(rate_limit))
+        // Auth management (token lifecycle)
+        .route(
+            "/api/v1/auth/token",
+            get(auth_status).post(auth_set).delete(auth_clear),
+        )
+        .route("/api/v1/auth/status", get(auth_status))
         // Content
         .route("/api/v1/search", get(search))
         .route("/api/v1/repos/detail", get(repo_detail))
@@ -264,6 +270,43 @@ async fn user_starred(
 async fn rate_limit(State(state): State<Arc<ServerState>>) -> Response {
     let (remaining, reset) = state.backend.rate_limit();
     Json(RateLimitDto { remaining, reset }).into_response()
+}
+
+// ── Auth management ─────────────────────────────────────────────────────
+
+async fn auth_status(State(state): State<Arc<ServerState>>) -> Response {
+    let backend = state.backend.clone();
+    run_task(
+        move || backend.token_status(),
+        |status| {
+            Json(AuthStatusDto {
+                has_token: status.has_token,
+                source: status.source.to_string(),
+            })
+            .into_response()
+        },
+    )
+    .await
+}
+
+async fn auth_set(
+    State(state): State<Arc<ServerState>>,
+    body: Result<Json<TokenSetRequest>, JsonRejection>,
+) -> Response {
+    let Ok(Json(req)) = body else {
+        return json_bad_request("invalid JSON body");
+    };
+    if req.token.trim().is_empty() {
+        return json_bad_request("token is required");
+    }
+    let token = req.token;
+    let backend = state.backend.clone();
+    run_task(move || backend.set_token(&token), |()| no_content()).await
+}
+
+async fn auth_clear(State(state): State<Arc<ServerState>>) -> Response {
+    let backend = state.backend.clone();
+    run_task(move || backend.clear_token(), |()| no_content()).await
 }
 
 // ── Content ─────────────────────────────────────────────────────────────
@@ -930,6 +973,33 @@ mod tests {
             (Some(99), Some(1_700_000_000))
         }
 
+        fn set_token(&self, token: &str) -> anyhow::Result<()> {
+            if let Some(e) = self.fail_error() {
+                return Err(e);
+            }
+            if token.trim().is_empty() {
+                return Err(anyhow::anyhow!("token is empty"));
+            }
+            Ok(())
+        }
+
+        fn clear_token(&self) -> anyhow::Result<()> {
+            if let Some(e) = self.fail_error() {
+                return Err(e);
+            }
+            Ok(())
+        }
+
+        fn token_status(&self) -> anyhow::Result<crate::service::TokenStatus> {
+            if let Some(e) = self.fail_error() {
+                return Err(e);
+            }
+            Ok(crate::service::TokenStatus {
+                has_token: true,
+                source: "stored",
+            })
+        }
+
         fn branches(&self, full_name: &str) -> anyhow::Result<Vec<String>> {
             if let Some(e) = self.fail_error() {
                 return Err(e);
@@ -1467,6 +1537,50 @@ mod tests {
             let response = post(app.clone(), uri, body).await;
             assert_eq!(response.status(), StatusCode::NO_CONTENT, "POST {uri}");
         }
+    }
+
+    #[tokio::test]
+    async fn auth_status_and_token_lifecycle() {
+        let app = test_app(Arc::new(FakeBackend::default()), None);
+
+        let response = get(app.clone(), "/api/v1/auth/status").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let status: AuthStatusDto = serde_json::from_value(json_body(response).await).unwrap();
+        assert!(status.has_token);
+        assert_eq!(status.source, "stored");
+
+        let response = post(
+            app.clone(),
+            "/api/v1/auth/token",
+            serde_json::json!({ "token": "ghp_newtoken" }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/api/v1/auth/token")
+                    .header("host", "127.0.0.1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn empty_token_is_400() {
+        let app = test_app(Arc::new(FakeBackend::default()), None);
+        let response = post(
+            app,
+            "/api/v1/auth/token",
+            serde_json::json!({ "token": "   " }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]

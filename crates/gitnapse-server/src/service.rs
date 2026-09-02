@@ -7,11 +7,12 @@
 //! full `gitnapse::provider::GitProvider` surface so no SDK capability is
 //! unreachable through the protocol.
 
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use axum::Json;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
+use gitnapse::auth::TokenSource;
 use gitnapse::error::GitHubError;
 use gitnapse::models::{
     CheckRun, CommitInfo, CompareResponse, Issue, MergeResponse, PullRequest, PullRequestDetail,
@@ -19,6 +20,24 @@ use gitnapse::models::{
 };
 use gitnapse::provider::{GitProvider, ProviderKind, create_provider};
 use gitnapse_protocol::ErrorDto;
+
+/// Backend-side error that maps to `409 Conflict` (e.g. token managed by env).
+#[derive(Debug)]
+pub struct Conflict(pub String);
+
+impl std::fmt::Display for Conflict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl std::error::Error for Conflict {}
+
+/// Token source plus whether a token is present (never the token itself).
+pub struct TokenStatus {
+    pub has_token: bool,
+    pub source: &'static str,
+}
 
 /// Minimal operations the HTTP layer needs. This is the seam between the
 /// protocol routes and the gitnapse SDK (or any future backend).
@@ -29,6 +48,14 @@ pub trait Backend: Send + Sync {
     fn starred_repos(&self, page: u32, per_page: u8) -> anyhow::Result<Vec<RepoSummary>>;
     fn repo_by_name(&self, full_name: &str) -> anyhow::Result<RepoSummary>;
     fn rate_limit(&self) -> (Option<u32>, Option<u64>);
+
+    // ── Auth management (token lifecycle) ────────────────────────────────
+    /// Persist a new token (validated against GitHub) and switch to it.
+    fn set_token(&self, token: &str) -> anyhow::Result<()>;
+    /// Forget the stored token and switch to anonymous access.
+    fn clear_token(&self) -> anyhow::Result<()>;
+    /// Report whether a token is active and where it comes from.
+    fn token_status(&self) -> anyhow::Result<TokenStatus>;
 
     // ── Content ──────────────────────────────────────────────────────────
     fn branches(&self, full_name: &str) -> anyhow::Result<Vec<String>>;
@@ -134,8 +161,11 @@ pub trait Backend: Send + Sync {
 }
 
 /// Real backend powered by the gitnapse SDK (GitHub provider).
+///
+/// The provider is swappable at runtime so `POST /api/v1/auth/token` and
+/// `DELETE /api/v1/auth/token` can take effect without a server restart.
 pub struct ApiService {
-    github: Arc<dyn GitProvider>,
+    github: RwLock<Arc<dyn GitProvider>>,
 }
 
 impl ApiService {
@@ -144,7 +174,17 @@ impl ApiService {
         gitnapse::runtime::ensure_crypto_provider();
         let token = gitnapse::auth::load_token()?;
         let github = create_provider(ProviderKind::GitHub, token.as_deref())?;
-        Ok(Self { github })
+        Ok(Self {
+            github: RwLock::new(github),
+        })
+    }
+
+    /// Snapshot of the current provider.
+    fn provider(&self) -> Arc<dyn GitProvider> {
+        self.github
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// Warn at startup when the server will run anonymously.
@@ -153,7 +193,7 @@ impl ApiService {
         if token.as_ref().map(|t| t.is_none()).unwrap_or(true) {
             log::warn!(
                 "no GitHub token found — requests will run anonymously with strict rate limits; \
-                 set GITHUB_TOKEN or run `gitnapse auth set`"
+                 set GITHUB_TOKEN, POST /api/v1/auth/token or run `gitnapse auth set`"
             );
         }
     }
@@ -161,38 +201,83 @@ impl ApiService {
 
 impl Backend for ApiService {
     fn authenticated_user(&self) -> anyhow::Result<Option<String>> {
-        self.github.fetch_authenticated_user()
+        self.provider().fetch_authenticated_user()
     }
 
     fn search(&self, query: &str, page: u32, per_page: u8) -> anyhow::Result<Vec<RepoSummary>> {
-        self.github.search_repositories_page(query, page, per_page)
+        self.provider()
+            .search_repositories_page(query, page, per_page)
     }
 
     fn starred_repos(&self, page: u32, per_page: u8) -> anyhow::Result<Vec<RepoSummary>> {
-        self.github.fetch_starred_repos(page, per_page)
+        self.provider().fetch_starred_repos(page, per_page)
     }
 
     fn repo_by_name(&self, full_name: &str) -> anyhow::Result<RepoSummary> {
-        self.github.fetch_repo_by_name(full_name)
+        self.provider().fetch_repo_by_name(full_name)
     }
 
     fn rate_limit(&self) -> (Option<u32>, Option<u64>) {
-        (
-            self.github.rate_limit_remaining(),
-            self.github.rate_limit_reset(),
-        )
+        let github = self.provider();
+        (github.rate_limit_remaining(), github.rate_limit_reset())
+    }
+
+    fn set_token(&self, token: &str) -> anyhow::Result<()> {
+        let token = token.trim();
+        if token.is_empty() {
+            return Err(anyhow::anyhow!("token is empty"));
+        }
+        if gitnapse::auth::token_source()? == TokenSource::Env {
+            return Err(Conflict(
+                "the active token comes from the GITHUB_TOKEN environment variable; \
+                 unset it (and restart the server) before storing a new one"
+                    .into(),
+            )
+            .into());
+        }
+        // Validate before persisting or swapping: never lock the user out.
+        let candidate = create_provider(ProviderKind::GitHub, Some(token))?;
+        candidate.fetch_authenticated_user()?;
+        gitnapse::auth::save_token(token)?;
+        *self.github.write().unwrap_or_else(|e| e.into_inner()) = candidate;
+        log::info!("GitHub token stored and activated");
+        Ok(())
+    }
+
+    fn clear_token(&self) -> anyhow::Result<()> {
+        if gitnapse::auth::token_source()? == TokenSource::Env {
+            return Err(Conflict(
+                "the token comes from the GITHUB_TOKEN environment variable; \
+                 unset it and restart the server to run anonymously"
+                    .into(),
+            )
+            .into());
+        }
+        gitnapse::auth::clear_token()?;
+        let anonymous = create_provider(ProviderKind::GitHub, None)?;
+        *self.github.write().unwrap_or_else(|e| e.into_inner()) = anonymous;
+        log::info!("GitHub token cleared; running anonymously");
+        Ok(())
+    }
+
+    fn token_status(&self) -> anyhow::Result<TokenStatus> {
+        let source = gitnapse::auth::token_source()?;
+        Ok(TokenStatus {
+            has_token: source != TokenSource::None,
+            source: source.label(),
+        })
     }
 
     fn branches(&self, full_name: &str) -> anyhow::Result<Vec<String>> {
-        self.github.fetch_branches(full_name)
+        self.provider().fetch_branches(full_name)
     }
 
     fn tree(&self, full_name: &str, git_ref: &str) -> anyhow::Result<Vec<RepoNode>> {
-        self.github.fetch_repo_tree(full_name, git_ref)
+        self.provider().fetch_repo_tree(full_name, git_ref)
     }
 
     fn file_content(&self, full_name: &str, path: &str, git_ref: &str) -> anyhow::Result<Vec<u8>> {
-        self.github
+        self.provider()
             .fetch_file_content_by_ref(full_name, path, git_ref)
     }
 
@@ -202,16 +287,16 @@ impl Backend for ApiService {
         branch: &str,
         per_page: u8,
     ) -> anyhow::Result<Vec<CommitInfo>> {
-        self.github
+        self.provider()
             .fetch_recent_commits(full_name, branch, per_page)
     }
 
     fn compare(&self, full_name: &str, base: &str, head: &str) -> anyhow::Result<CompareResponse> {
-        self.github.fetch_compare(full_name, base, head)
+        self.provider().fetch_compare(full_name, base, head)
     }
 
     fn check_runs(&self, full_name: &str, git_ref: &str) -> anyhow::Result<Vec<CheckRun>> {
-        self.github.fetch_check_runs(full_name, git_ref)
+        self.provider().fetch_check_runs(full_name, git_ref)
     }
 
     fn workflow_runs(
@@ -220,11 +305,12 @@ impl Backend for ApiService {
         branch: &str,
         per_page: u8,
     ) -> anyhow::Result<Vec<WorkflowRun>> {
-        self.github.fetch_workflow_runs(full_name, branch, per_page)
+        self.provider()
+            .fetch_workflow_runs(full_name, branch, per_page)
     }
 
     fn issues(&self, full_name: &str, state: &str, per_page: u8) -> anyhow::Result<Vec<Issue>> {
-        self.github.fetch_issues(full_name, state, per_page)
+        self.provider().fetch_issues(full_name, state, per_page)
     }
 
     fn create_issue(
@@ -233,11 +319,11 @@ impl Backend for ApiService {
         title: &str,
         body: Option<&str>,
     ) -> anyhow::Result<Issue> {
-        self.github.create_issue(full_name, title, body)
+        self.provider().create_issue(full_name, title, body)
     }
 
     fn close_issue(&self, full_name: &str, number: u64) -> anyhow::Result<Issue> {
-        self.github.close_issue(full_name, number)
+        self.provider().close_issue(full_name, number)
     }
 
     fn pull_requests(
@@ -246,7 +332,8 @@ impl Backend for ApiService {
         state: &str,
         per_page: u8,
     ) -> anyhow::Result<Vec<PullRequest>> {
-        self.github.fetch_pull_requests(full_name, state, per_page)
+        self.provider()
+            .fetch_pull_requests(full_name, state, per_page)
     }
 
     fn pull_request_detail(
@@ -254,7 +341,7 @@ impl Backend for ApiService {
         full_name: &str,
         number: u64,
     ) -> anyhow::Result<PullRequestDetail> {
-        self.github.fetch_pull_request_detail(full_name, number)
+        self.provider().fetch_pull_request_detail(full_name, number)
     }
 
     fn pull_request_reviews(
@@ -262,7 +349,8 @@ impl Backend for ApiService {
         full_name: &str,
         number: u64,
     ) -> anyhow::Result<Vec<PullRequestReview>> {
-        self.github.fetch_pull_request_reviews(full_name, number)
+        self.provider()
+            .fetch_pull_request_reviews(full_name, number)
     }
 
     fn pull_request_comments(
@@ -270,7 +358,8 @@ impl Backend for ApiService {
         full_name: &str,
         number: u64,
     ) -> anyhow::Result<Vec<ReviewComment>> {
-        self.github.fetch_pull_request_comments(full_name, number)
+        self.provider()
+            .fetch_pull_request_comments(full_name, number)
     }
 
     fn pull_request_commits(
@@ -278,7 +367,8 @@ impl Backend for ApiService {
         full_name: &str,
         number: u64,
     ) -> anyhow::Result<Vec<CommitInfo>> {
-        self.github.fetch_pull_request_commits(full_name, number)
+        self.provider()
+            .fetch_pull_request_commits(full_name, number)
     }
 
     fn create_pull_request(
@@ -289,7 +379,7 @@ impl Backend for ApiService {
         base: &str,
         body: Option<&str>,
     ) -> anyhow::Result<PullRequestDetail> {
-        self.github
+        self.provider()
             .create_pull_request(full_name, title, head, base, body)
     }
 
@@ -300,12 +390,13 @@ impl Backend for ApiService {
         commit_title: Option<&str>,
         method: Option<&str>,
     ) -> anyhow::Result<MergeResponse> {
-        self.github
+        self.provider()
             .merge_pull_request(full_name, number, commit_title, method)
     }
 
     fn update_pull_request(&self, full_name: &str, number: u64, state: &str) -> anyhow::Result<()> {
-        self.github.update_pull_request(full_name, number, state)
+        self.provider()
+            .update_pull_request(full_name, number, state)
     }
 
     fn create_pull_request_review(
@@ -315,7 +406,7 @@ impl Backend for ApiService {
         body: &str,
         event: &str,
     ) -> anyhow::Result<()> {
-        self.github
+        self.provider()
             .create_pull_request_review(full_name, number, body, event)
     }
 
@@ -325,12 +416,12 @@ impl Backend for ApiService {
         number: u64,
         body: &str,
     ) -> anyhow::Result<()> {
-        self.github
+        self.provider()
             .create_pull_request_comment(full_name, number, body)
     }
 
     fn releases(&self, full_name: &str, per_page: u8) -> anyhow::Result<Vec<Release>> {
-        self.github.fetch_releases(full_name, per_page)
+        self.provider().fetch_releases(full_name, per_page)
     }
 
     fn create_release(
@@ -341,7 +432,7 @@ impl Backend for ApiService {
         body: Option<&str>,
         prerelease: bool,
     ) -> anyhow::Result<Release> {
-        self.github
+        self.provider()
             .create_release(full_name, tag_name, name, body, prerelease)
     }
 
@@ -351,7 +442,7 @@ impl Backend for ApiService {
         description: Option<&str>,
         private: bool,
     ) -> anyhow::Result<RepoSummary> {
-        self.github.create_repo(name, description, private)
+        self.provider().create_repo(name, description, private)
     }
 }
 
@@ -363,6 +454,12 @@ impl Backend for ApiService {
 
 /// Map an upstream error to (status code, safe client message).
 pub fn classify(e: &anyhow::Error) -> (StatusCode, &'static str) {
+    if let Some(_c) = e.downcast_ref::<Conflict>() {
+        return (
+            StatusCode::CONFLICT,
+            "token cannot be changed in this configuration (check the server logs)",
+        );
+    }
     if let Some(gh) = e.downcast_ref::<GitHubError>() {
         return match gh {
             GitHubError::Unauthorized => (

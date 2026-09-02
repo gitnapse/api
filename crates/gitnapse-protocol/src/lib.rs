@@ -233,6 +233,20 @@ pub struct RateLimitDto {
     pub reset: Option<u64>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuthStatusDto {
+    /// Whether a GitHub token is currently active on the server.
+    pub has_token: bool,
+    /// `env`, `oauth`, `stored` or `none`.
+    pub source: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct TokenSetRequest {
+    /// GitHub personal access token (or OAuth token) to store and activate.
+    pub token: String,
+}
+
 // ── Requests (query parameters, URL-encoded) ────────────────────────────
 //
 // These structs are deserialized directly from the URL query string by any

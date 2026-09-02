@@ -40,6 +40,10 @@ versioned.
   `GITNAPSE_SERVER_TOKEN`) to require `Authorization: Bearer <secret>` on every
   `/api/*` request. Clients opt in with `Client::with_api_token("…")`.
   `GET /` and `GET /health` stay open.
+- The GitHub token can also be managed at runtime through the
+  [auth endpoints](#auth-management): `gitnapseapp` (or any interface) can
+  store/clear the token without a server restart. New tokens are validated
+  against GitHub before being persisted.
 
 ## Errors
 
@@ -54,6 +58,7 @@ never leak internals:
 | `403` | Request not from a loopback host, or GitHub rejected the request |
 | `404` | Endpoint, repository, branch, file, issue or PR not found |
 | `409`/`422` | Upstream rejection surfaced with GitHub's own code (e.g. merge conflict) |
+| `409` | Token cannot be changed because it is managed by the `GITHUB_TOKEN` env |
 | `413` | Response above server limits (file/tree too large) |
 | `429` | GitHub rate limit exceeded |
 | `502` | Upstream (GitHub) unreachable |
@@ -79,6 +84,19 @@ Example:
 | `GET /api/v1/user` | Authenticated login (`{ "login": "x" }`; `401` when anonymous) |
 | `GET /api/v1/user/starred?page=&per_page=` | Starred repos of the user |
 | `GET /api/v1/rate-limit` | `{ "remaining", "reset" }` from the last responses (nullable) |
+
+### Auth management
+
+| Endpoint | Description |
+|---|---|
+| `GET /api/v1/auth/status` | `{ "has_token": bool, "source": "env"\|"oauth"\|"stored"\|"none" }` (never the token itself) |
+| `POST /api/v1/auth/token` | Body `{ "token" }` → validates against GitHub (`401` if rejected), stores it in the secure store and switches the server to it → `204` |
+| `DELETE /api/v1/auth/token` | Forgets the stored token and switches to anonymous → `204` |
+
+Notes: when the token comes from the `GITHUB_TOKEN` environment variable,
+`POST`/`DELETE` return `409` (unset the env var and restart first). These
+endpoints are guarded exactly like the rest of the API (loopback host,
+optional bearer) and are reachable by non-browser clients only.
 
 ### Content
 

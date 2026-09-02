@@ -21,6 +21,14 @@
   `Backend` trait, so the suite runs without keyring/OAuth/network and covers
   the full surface, error mapping (404/401), the API-token guard,
   DNS-rebinding guard, JSON 404 fallback and 400 validation. (`crates/gitnapse-server/src/routes.rs`)
+- **Token lifecycle endpoints**: `GET /api/v1/auth/status`
+  (`{ has_token, source }`, never the token), `POST /api/v1/auth/token`
+  (validates against GitHub, stores it, swaps the provider at runtime, no
+  restart) and `DELETE /api/v1/auth/token` (back to anonymous). When the token
+  is managed by `GITHUB_TOKEN`, mutations return `409`. Backend methods and
+  `gitnapse-client` helpers (`auth_status`, `set_token`, `clear_token`)
+  included. The core exposes a typed `TokenSource`/`token_source()` for this.
+  (`crates/gitnapse-server`, `crates/gitnapse-client`, `../gitnapse`)
 
 ### Changed
 

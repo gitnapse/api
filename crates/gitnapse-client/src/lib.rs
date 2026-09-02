@@ -16,9 +16,9 @@
 //! ```
 
 use gitnapse_protocol::{
-    API_PREFIX, CheckRunDto, CommitDto, CompareDto, ContentDto, ErrorDto, HealthDto, IssueDto,
-    MergeResultDto, PrCommentDto, PrDetailDto, PrReviewDto, PrSummaryDto, RateLimitDto, ReleaseDto,
-    RepoDto, TreeNodeDto, UserDto, WorkflowRunDto,
+    API_PREFIX, AuthStatusDto, CheckRunDto, CommitDto, CompareDto, ContentDto, ErrorDto, HealthDto,
+    IssueDto, MergeResultDto, PrCommentDto, PrDetailDto, PrReviewDto, PrSummaryDto, RateLimitDto,
+    ReleaseDto, RepoDto, TreeNodeDto, UserDto, WorkflowRunDto,
 };
 use reqwest::StatusCode;
 use std::time::Duration;
@@ -129,6 +129,33 @@ impl Client {
         let response = self.send(reqwest::Method::POST, url, Some(value)).await?;
         drop(response);
         Ok(())
+    }
+
+    /// DELETE and discard the (empty) response body.
+    async fn delete_void(&self, path: &str) -> Result<()> {
+        let url = self.endpoint(&format!("{API_PREFIX}{path}"))?;
+        let response = self.send(reqwest::Method::DELETE, url, None).await?;
+        drop(response);
+        Ok(())
+    }
+
+    // ── Auth management ──────────────────────────────────────────────────
+
+    /// `GET /api/v1/auth/status` — whether a token is active and its source.
+    pub async fn auth_status(&self) -> Result<AuthStatusDto> {
+        let url = self.endpoint(&format!("{API_PREFIX}/auth/status"))?;
+        self.get_json(url).await
+    }
+
+    /// `POST /api/v1/auth/token` — validate, store and activate a new token.
+    pub async fn set_token(&self, token: &str) -> Result<()> {
+        let body = serde_json::json!({ "token": token });
+        self.post_void("/auth/token", &body).await
+    }
+
+    /// `DELETE /api/v1/auth/token` — forget the stored token (anonymous).
+    pub async fn clear_token(&self) -> Result<()> {
+        self.delete_void("/auth/token").await
     }
 
     // ── Infrastructure ───────────────────────────────────────────────────
