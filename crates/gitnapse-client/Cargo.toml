@@ -1,0 +1,18 @@
+[package]
+name = "gitnapse-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Typed HTTP client for the GitNapse protocol. Consumes gitnapse-server over HTTP — no dependency on the gitnapse core."
+
+[dependencies]
+gitnapse-protocol = { workspace = true }
+anyhow = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = "2"
+url = "2.5"
+
+[dev-dependencies]
+tokio = { workspace = true }

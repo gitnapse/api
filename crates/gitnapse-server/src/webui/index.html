@@ -46,23 +46,46 @@
       $('status').textContent = `API ${j.status} · v${j.version}`;
     } catch { $('status').textContent = 'API offline'; }
   }
+  // All repo fields come from the public GitHub API and must be rendered as
+  // text, never parsed as HTML (DOM-XSS safe).
+  function renderRepo(repo) {
+    const li = document.createElement('li');
+
+    const repoRow = document.createElement('span');
+    repoRow.className = 'repo';
+    repoRow.textContent = repo.full_name;
+
+    const lang = document.createElement('span');
+    lang.className = 'lang';
+    lang.textContent = repo.language || '';
+
+    const stars = document.createElement('span');
+    stars.className = 'stars';
+    stars.textContent = `${repo.stargazers_count} stars`;
+
+    const desc = document.createElement('div');
+    desc.className = 'desc';
+    desc.textContent = repo.description || '';
+
+    li.append(repoRow, lang, stars, desc);
+    return li;
+  }
   async function search() {
     const q = $('q').value.trim() || 'gitnapse';
-    $('results').innerHTML = '';
+    const results = $('results');
+    results.replaceChildren();
     $('error').textContent = '';
     try {
       const r = await fetch(`/api/v1/search?q=${encodeURIComponent(q)}&per_page=20`);
       if (!r.ok) throw new Error(`HTTP ${r.status}`);
       const repos = await r.json();
-      if (!repos.length) { $('results').innerHTML = '<li>No results.</li>'; return; }
-      for (const repo of repos) {
-        const li = document.createElement('li');
-        li.innerHTML = `<span class="repo">${repo.full_name}</span>
-          <span class="lang">${repo.language || ''}</span>
-          <span class="stars">★ ${repo.stargazers_count}</span>
-          <div class="desc">${repo.description || ''}</div>`;
-        $('results').appendChild(li);
+      if (!repos.length) {
+        const empty = document.createElement('li');
+        empty.textContent = 'No results.';
+        results.append(empty);
+        return;
       }
+      for (const repo of repos) results.append(renderRepo(repo));
     } catch (e) { $('error').textContent = 'Search failed: ' + e.message; }
   }
   $('go').addEventListener('click', search);
