@@ -2,19 +2,22 @@
 //! (Free functions — `impl From` would violate the orphan rule.)
 
 use gitnapse::models::{
-    CheckRun, CommitInfo, CompareResponse, DiffFile, Issue, IssueLabel, IssueUser, MergeResponse,
-    PullRequest, PullRequestDetail, PullRequestReview, Release, RepoNode, RepoSummary,
-    ReviewComment, WorkflowRun,
+    CheckRun, CodeSearchResult, CommitInfo, CompareResponse, Contributor, DiffFile, Issue,
+    IssueComment, IssueLabel, IssueUser, LanguageStat, MergeResponse, Notification, PullRequest,
+    PullRequestDetail, PullRequestReview, Release, RepoNode, RepoSummary, ReviewComment, UserEvent,
+    UserProfile, WorkflowRun,
 };
 use gitnapse_protocol::{
-    ActorDto, CheckRunDto, CommitDto, CompareDto, DiffFileDto, IssueDto, LabelDto, MergeResultDto,
+    ActorDto, CheckRunDto, CodeSearchResultDto, CommitDto, CompareDto, ContributorDto, DiffFileDto,
+    EventDto, IssueCommentDto, IssueDto, LabelDto, LanguageDto, MergeResultDto, NotificationDto,
     PrBranchDto, PrCommentDto, PrDetailDto, PrReviewDto, PrSummaryDto, ReleaseDto, RepoDto,
-    TreeNodeDto, WorkflowRunDto,
+    TreeNodeDto, UserProfileDto, WorkflowRunDto,
 };
 
 fn actor(u: &IssueUser) -> ActorDto {
     ActorDto {
         login: u.login.clone(),
+        avatar_url: u.avatar_url.clone(),
     }
 }
 
@@ -35,6 +38,15 @@ pub fn repo_dto(r: &RepoSummary) -> RepoDto {
         language: r.language.clone(),
         default_branch: r.default_branch.clone(),
         clone_url: r.clone_url.clone(),
+        html_url: r.html_url.clone(),
+        forks_count: r.forks_count,
+        open_issues_count: r.open_issues_count,
+        watchers_count: r.watchers_count,
+        private: r.private,
+        topics: r.topics.clone(),
+        updated_at: r.updated_at.clone(),
+        pushed_at: r.pushed_at.clone(),
+        owner_avatar_url: r.owner.avatar_url.clone(),
     }
 }
 
@@ -149,6 +161,7 @@ fn commit_dto(c: &CommitInfo) -> CommitDto {
         message: c.commit.message.clone(),
         author_name: c.commit.author.name.clone(),
         author_date: c.commit.author.date.clone(),
+        author: c.author.as_ref().map(actor),
     }
 }
 
@@ -165,6 +178,10 @@ fn diff_file_dto(f: &DiffFile) -> DiffFileDto {
         changes: f.changes,
         patch: f.patch.clone(),
     }
+}
+
+pub fn diff_files_dto(list: &[DiffFile]) -> Vec<DiffFileDto> {
+    list.iter().map(diff_file_dto).collect()
 }
 
 pub fn compare_dto(c: &CompareResponse) -> CompareDto {
@@ -208,5 +225,87 @@ pub fn release_dto(r: &Release) -> ReleaseDto {
         created_at: r.created_at.clone(),
         published_at: r.published_at.clone(),
         prerelease: r.prerelease,
+    }
+}
+
+// ── Dashboard surface (issues comments, users, activity, insights) ──────
+
+pub fn issue_comment_dto(c: &IssueComment) -> IssueCommentDto {
+    IssueCommentDto {
+        id: c.id,
+        user: actor(&c.user),
+        body: c.body.clone(),
+        created_at: c.created_at.clone(),
+        updated_at: c.updated_at.clone(),
+        html_url: c.html_url.clone(),
+    }
+}
+
+pub fn user_profile_dto(u: &UserProfile) -> UserProfileDto {
+    UserProfileDto {
+        login: u.login.clone(),
+        name: u.name.clone(),
+        avatar_url: u.avatar_url.clone(),
+        bio: u.bio.clone(),
+        company: u.company.clone(),
+        location: u.location.clone(),
+        blog: u.blog.clone(),
+        followers: u.followers,
+        following: u.following,
+        public_repos: u.public_repos,
+        html_url: u.html_url.clone(),
+        created_at: u.created_at.clone(),
+    }
+}
+
+pub fn event_dto(e: &UserEvent) -> EventDto {
+    EventDto {
+        id: e.id.clone(),
+        kind: e.kind.clone(),
+        actor: e.actor.clone(),
+        actor_avatar_url: e.actor_avatar_url.clone(),
+        repo: e.repo.clone(),
+        action: e.action.clone(),
+        title: e.title.clone(),
+        created_at: e.created_at.clone(),
+    }
+}
+
+pub fn notification_dto(n: &Notification) -> NotificationDto {
+    NotificationDto {
+        id: n.id.clone(),
+        unread: n.unread,
+        reason: n.reason.clone(),
+        subject_type: n.subject_type.clone(),
+        subject_title: n.subject_title.clone(),
+        repo: n.repo.clone(),
+        updated_at: n.updated_at.clone(),
+        html_url: n.html_url.clone(),
+    }
+}
+
+pub fn code_search_result_dto(c: &CodeSearchResult) -> CodeSearchResultDto {
+    CodeSearchResultDto {
+        repo: c.repo.clone(),
+        path: c.path.clone(),
+        name: c.name.clone(),
+        sha: c.sha.clone(),
+        html_url: c.html_url.clone(),
+    }
+}
+
+pub fn language_dto(l: &LanguageStat) -> LanguageDto {
+    LanguageDto {
+        name: l.name.clone(),
+        bytes: l.bytes,
+    }
+}
+
+pub fn contributor_dto(c: &Contributor) -> ContributorDto {
+    ContributorDto {
+        login: c.login.clone(),
+        avatar_url: c.avatar_url.clone(),
+        contributions: c.contributions,
+        html_url: c.html_url.clone(),
     }
 }

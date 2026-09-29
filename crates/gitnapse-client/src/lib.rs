@@ -16,9 +16,11 @@
 //! ```
 
 use gitnapse_protocol::{
-    API_PREFIX, AuthStatusDto, CheckRunDto, CommitDto, CompareDto, ContentDto, ErrorDto, HealthDto,
-    IssueDto, MergeResultDto, PrCommentDto, PrDetailDto, PrReviewDto, PrSummaryDto, RateLimitDto,
-    ReleaseDto, RepoDto, TreeNodeDto, UserDto, WorkflowRunDto,
+    API_PREFIX, AuthStatusDto, CheckRunDto, CodeSearchResultDto, CommitDto, CompareDto, ContentDto,
+    ContributorDto, DiffFileDto, ErrorDto, EventDto, HealthDto, IssueCommentDto, IssueDto,
+    LanguageDto, MergeResultDto, NotificationDto, PrCommentDto, PrDetailDto, PrReviewDto,
+    PrSummaryDto, RateLimitDto, ReleaseDto, RepoDto, TreeNodeDto, UserDto, UserProfileDto,
+    WorkflowRunDto,
 };
 use reqwest::StatusCode;
 use std::time::Duration;
@@ -193,6 +195,70 @@ impl Client {
         self.get_json(url).await
     }
 
+    // ── Users / profile, activity, notifications ─────────────────────────
+
+    /// `GET /api/v1/users/profile` — public profile of a GitHub user.
+    pub async fn user_profile(&self, login: &str) -> Result<UserProfileDto> {
+        let mut url = self.endpoint(&format!("{API_PREFIX}/users/profile"))?;
+        url.query_pairs_mut().append_pair("login", login);
+        self.get_json(url).await
+    }
+
+    /// `GET /api/v1/users/repos` — public repositories of a user.
+    ///
+    /// `sort` is `created`, `updated`, `pushed` or `full_name`.
+    pub async fn user_repos(
+        &self,
+        login: &str,
+        sort: Option<&str>,
+        page: Option<u32>,
+        per_page: Option<u8>,
+    ) -> Result<Vec<RepoDto>> {
+        let mut url = self.endpoint(&format!("{API_PREFIX}/users/repos"))?;
+        url.query_pairs_mut()
+            .append_pair("login", login)
+            .append_pair("page", &page.unwrap_or(1).to_string())
+            .append_pair("per_page", &per_page.unwrap_or(30).to_string());
+        if let Some(sort) = sort {
+            url.query_pairs_mut().append_pair("sort", sort);
+        }
+        self.get_json(url).await
+    }
+
+    /// `GET /api/v1/users/events` — public activity feed of a user.
+    pub async fn user_events(
+        &self,
+        login: &str,
+        page: Option<u32>,
+        per_page: Option<u8>,
+    ) -> Result<Vec<EventDto>> {
+        let mut url = self.endpoint(&format!("{API_PREFIX}/users/events"))?;
+        url.query_pairs_mut()
+            .append_pair("login", login)
+            .append_pair("page", &page.unwrap_or(1).to_string())
+            .append_pair("per_page", &per_page.unwrap_or(30).to_string());
+        self.get_json(url).await
+    }
+
+    /// `GET /api/v1/users/notifications` — authenticated user's inbox.
+    pub async fn notifications(
+        &self,
+        page: Option<u32>,
+        per_page: Option<u8>,
+    ) -> Result<Vec<NotificationDto>> {
+        let mut url = self.endpoint(&format!("{API_PREFIX}/users/notifications"))?;
+        url.query_pairs_mut()
+            .append_pair("page", &page.unwrap_or(1).to_string())
+            .append_pair("per_page", &per_page.unwrap_or(30).to_string());
+        self.get_json(url).await
+    }
+
+    /// `POST /api/v1/users/notifications/read` — mark a thread as read.
+    pub async fn notification_mark_read(&self, id: &str) -> Result<()> {
+        let body = serde_json::json!({ "id": id });
+        self.post_void("/users/notifications/read", &body).await
+    }
+
     // ── Content ──────────────────────────────────────────────────────────
 
     /// `GET /api/v1/search` — search repositories.
@@ -203,6 +269,36 @@ impl Client {
         per_page: Option<u8>,
     ) -> Result<Vec<RepoDto>> {
         let mut url = self.endpoint(&format!("{API_PREFIX}/search"))?;
+        url.query_pairs_mut()
+            .append_pair("q", query)
+            .append_pair("page", &page.unwrap_or(1).to_string())
+            .append_pair("per_page", &per_page.unwrap_or(30).to_string());
+        self.get_json(url).await
+    }
+
+    /// `GET /api/v1/search/users` — search GitHub users.
+    pub async fn search_users(
+        &self,
+        query: &str,
+        page: Option<u32>,
+        per_page: Option<u8>,
+    ) -> Result<Vec<UserProfileDto>> {
+        let mut url = self.endpoint(&format!("{API_PREFIX}/search/users"))?;
+        url.query_pairs_mut()
+            .append_pair("q", query)
+            .append_pair("page", &page.unwrap_or(1).to_string())
+            .append_pair("per_page", &per_page.unwrap_or(30).to_string());
+        self.get_json(url).await
+    }
+
+    /// `GET /api/v1/search/code` — search code across GitHub.
+    pub async fn search_code(
+        &self,
+        query: &str,
+        page: Option<u32>,
+        per_page: Option<u8>,
+    ) -> Result<Vec<CodeSearchResultDto>> {
+        let mut url = self.endpoint(&format!("{API_PREFIX}/search/code"))?;
         url.query_pairs_mut()
             .append_pair("q", query)
             .append_pair("page", &page.unwrap_or(1).to_string())
@@ -247,6 +343,28 @@ impl Client {
             .append_pair("path", path);
         if let Some(git_ref) = git_ref {
             url.query_pairs_mut().append_pair("ref", git_ref);
+        }
+        self.get_json(url).await
+    }
+
+    /// `GET /api/v1/repos/languages` — language breakdown by bytes.
+    pub async fn languages(&self, repo: &str) -> Result<Vec<LanguageDto>> {
+        let mut url = self.endpoint(&format!("{API_PREFIX}/repos/languages"))?;
+        url.query_pairs_mut().append_pair("repo", repo);
+        self.get_json(url).await
+    }
+
+    /// `GET /api/v1/repos/contributors` — contributors of a repository.
+    pub async fn contributors(
+        &self,
+        repo: &str,
+        per_page: Option<u8>,
+    ) -> Result<Vec<ContributorDto>> {
+        let mut url = self.endpoint(&format!("{API_PREFIX}/repos/contributors"))?;
+        url.query_pairs_mut().append_pair("repo", repo);
+        if let Some(per_page) = per_page {
+            url.query_pairs_mut()
+                .append_pair("per_page", &per_page.to_string());
         }
         self.get_json(url).await
     }
@@ -346,6 +464,41 @@ impl Client {
     pub async fn close_issue(&self, repo: &str, number: u64) -> Result<IssueDto> {
         let body = serde_json::json!({ "repo": repo, "number": number });
         self.post_json("/issues/close", &body).await
+    }
+
+    /// `GET /api/v1/issues/detail` — full detail of a single issue.
+    pub async fn issue_detail(&self, repo: &str, number: u64) -> Result<IssueDto> {
+        let mut url = self.endpoint(&format!("{API_PREFIX}/issues/detail"))?;
+        url.query_pairs_mut()
+            .append_pair("repo", repo)
+            .append_pair("number", &number.to_string());
+        self.get_json(url).await
+    }
+
+    /// `GET /api/v1/issues/comments` — conversation comments of an issue.
+    pub async fn issue_comments(&self, repo: &str, number: u64) -> Result<Vec<IssueCommentDto>> {
+        let mut url = self.endpoint(&format!("{API_PREFIX}/issues/comments"))?;
+        url.query_pairs_mut()
+            .append_pair("repo", repo)
+            .append_pair("number", &number.to_string());
+        self.get_json(url).await
+    }
+
+    /// `POST /api/v1/issues/comment` — comment on an issue.
+    pub async fn create_issue_comment(
+        &self,
+        repo: &str,
+        number: u64,
+        body: &str,
+    ) -> Result<IssueCommentDto> {
+        let payload = serde_json::json!({ "repo": repo, "number": number, "body": body });
+        self.post_json("/issues/comment", &payload).await
+    }
+
+    /// `POST /api/v1/issues/reopen` — reopen a closed issue.
+    pub async fn reopen_issue(&self, repo: &str, number: u64) -> Result<IssueDto> {
+        let payload = serde_json::json!({ "repo": repo, "number": number });
+        self.post_json("/issues/reopen", &payload).await
     }
 
     // ── Pull requests ────────────────────────────────────────────────────
@@ -453,6 +606,24 @@ impl Client {
     pub async fn comment_pull_request(&self, repo: &str, number: u64, body: &str) -> Result<()> {
         let payload = serde_json::json!({ "repo": repo, "number": number, "body": body });
         self.post_void("/pulls/comments", &payload).await
+    }
+
+    /// `GET /api/v1/pulls/files` — files changed by a pull request.
+    pub async fn pr_files(&self, repo: &str, number: u64) -> Result<Vec<DiffFileDto>> {
+        let mut url = self.endpoint(&format!("{API_PREFIX}/pulls/files"))?;
+        url.query_pairs_mut()
+            .append_pair("repo", repo)
+            .append_pair("number", &number.to_string());
+        self.get_json(url).await
+    }
+
+    /// `GET /api/v1/pulls/conversation` — conversation comments of a PR.
+    pub async fn pr_conversation(&self, repo: &str, number: u64) -> Result<Vec<IssueCommentDto>> {
+        let mut url = self.endpoint(&format!("{API_PREFIX}/pulls/conversation"))?;
+        url.query_pairs_mut()
+            .append_pair("repo", repo)
+            .append_pair("number", &number.to_string());
+        self.get_json(url).await
     }
 
     /// `GET /api/v1/pulls/commits` — commits of a pull request.

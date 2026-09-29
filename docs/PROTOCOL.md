@@ -24,6 +24,12 @@ the version (`/api/v2/...`). The current prefix is exported by the protocol
 crate as `gitnapse_protocol::API_PREFIX`. `GET /health` is infrastructure, not
 versioned.
 
+**Additive changes do not bump the version**: new operations, new optional DTO
+fields and new enum-ish values (e.g. a new `state` accepted by an existing
+parameter) keep serving under `/api/v1`. Clients must ignore unknown fields and
+treat new response fields as optional; producers must only add fields, never
+rename or remove them within a version.
+
 ## Transport
 
 - HTTP/JSON. Server binds `127.0.0.1:8787` by default and **rejects requests
@@ -85,11 +91,21 @@ Example:
 | `GET /api/v1/user/starred?page=&per_page=` | Starred repos of the user |
 | `GET /api/v1/rate-limit` | `{ "remaining", "reset" }` from the last responses (nullable) |
 
+### Users / profile
+
+| Endpoint | Description |
+|---|---|
+| `GET /api/v1/users/profile?login=` | Public profile (`UserProfileDto`) |
+| `GET /api/v1/users/repos?login=&sort=&page=&per_page=` | Public repos; `sort` is `created`\|`updated`\|`pushed`\|`full_name` (default `updated`) |
+| `GET /api/v1/users/events?login=&page=&per_page=` | Public activity feed (`EventDto[]`, newest first) |
+| `GET /api/v1/users/notifications?page=&per_page=` | Authenticated user's notification inbox (`NotificationDto[]`; `401` when anonymous) |
+| `POST /api/v1/users/notifications/read` | Body `{ "id" }` (thread id from `NotificationDto`) -> `204` |
+
 ### Auth management
 
 | Endpoint | Description |
 |---|---|
-| `GET /api/v1/auth/status` | `{ "has_token": bool, "source": "env"\|"oauth"\|"stored"\|"none" }` (never the token itself) |
+| `GET /api/v1/auth/status` | `{ "has_token": bool, "source": "GITHUB_TOKEN env"\|"OAuth session"\|"stored token"\|"none" }` (never the token itself; `source` is the core `TokenSource` label) |
 | `POST /api/v1/auth/token` | Body `{ "token" }` → validates against GitHub (`401` if rejected), stores it in the secure store and switches the server to it → `204` |
 | `DELETE /api/v1/auth/token` | Forgets the stored token and switches to anonymous → `204` |
 
@@ -98,15 +114,24 @@ Notes: when the token comes from the `GITHUB_TOKEN` environment variable,
 endpoints are guarded exactly like the rest of the API (loopback host,
 optional bearer) and are reachable by non-browser clients only.
 
-### Content
+### Search
 
 | Endpoint | Description |
 |---|---|
 | `GET /api/v1/search?q=&page=&per_page=` | Search repositories (max `per_page` 100) |
-| `GET /api/v1/repos/detail?repo=owner/name` | Repository metadata |
+| `GET /api/v1/search/users?q=&page=&per_page=` | Search users (`UserProfileDto[]`; reduced objects, counts may be `0`) |
+| `GET /api/v1/search/code?q=&page=&per_page=` | Search code (`CodeSearchResultDto[]`; `q` is required by GitHub) |
+
+### Content
+
+| Endpoint | Description |
+|---|---|
+| `GET /api/v1/repos/detail?repo=owner/name` | Repository metadata (counts, topics, timestamps, owner avatar) |
 | `GET /api/v1/repos/branches?repo=` | Branch names |
 | `GET /api/v1/repos/tree?repo=&ref=` | Full tree (pre-order; `ref` -> `HEAD`; `413` > 200k nodes) |
 | `GET /api/v1/repos/content?repo=&path=&ref=` | File content, base64 (`413` > 16 MiB) |
+| `GET /api/v1/repos/languages?repo=` | Bytes per language (`LanguageDto[]`, sorted by bytes desc) |
+| `GET /api/v1/repos/contributors?repo=&per_page=` | Contributors (`ContributorDto[]`) |
 
 ### Commits / CI
 
@@ -122,8 +147,12 @@ optional bearer) and are reachable by non-browser clients only.
 | Endpoint | Description |
 |---|---|
 | `GET /api/v1/issues?repo=&state=&per_page=` | List (`state` open\|closed\|all -> open) |
+| `GET /api/v1/issues/detail?repo=&number=` | Full detail of one issue (`IssueDto`) |
+| `GET /api/v1/issues/comments?repo=&number=` | Conversation comments (`IssueCommentDto[]`) |
 | `POST /api/v1/issues` | `{ "repo", "title", "body"? }` -> `201` issue |
+| `POST /api/v1/issues/comment` | `{ "repo", "number", "body" }` -> `201` comment |
 | `POST /api/v1/issues/close` | `{ "repo", "number" }` -> closed issue |
+| `POST /api/v1/issues/reopen` | `{ "repo", "number" }` -> reopened issue |
 
 ### Pull requests
 
@@ -131,6 +160,8 @@ optional bearer) and are reachable by non-browser clients only.
 |---|---|
 | `GET /api/v1/pulls?repo=&state=&per_page=` | List (`state` -> open) |
 | `GET /api/v1/pulls/detail?repo=&number=` | Full detail (branches, merge info, counts) |
+| `GET /api/v1/pulls/files?repo=&number=` | Changed files with patches (`DiffFileDto[]`, first page ≤ 100) |
+| `GET /api/v1/pulls/conversation?repo=&number=` | Conversation comments (`IssueCommentDto[]`) |
 | `GET /api/v1/pulls/reviews?repo=&number=` | Reviews |
 | `GET /api/v1/pulls/comments?repo=&number=` | Inline review comments |
 | `GET /api/v1/pulls/commits?repo=&number=` | Commits |
@@ -161,7 +192,14 @@ let me = client.user().await?;                                  // GET /user
 let repos = client.search("language:rust", Some(1), Some(20)).await?;
 let branches = client.branches("gitnapse/gitnapse").await?;
 let issues = client.issues("gitnapse/gitnapse", Some("open"), None).await?;
+let issue = client.issue_detail("gitnapse/gitnapse", 7).await?;
+let comments = client.issue_comments("gitnapse/gitnapse", 7).await?;
+let profile = client.user_profile("xscriptor").await?;
+let inbox = client.notifications(Some(1), Some(20)).await?;
+let hits = client.search_code("repo:gitnapse/api fn main", None, None).await?;
+let langs = client.languages("gitnapse/gitnapse").await?;
 let prs = client.pull_requests("gitnapse/gitnapse", None, None).await?;
+let files = client.pr_files("gitnapse/gitnapse", 7).await?;
 let pr = client.create_pull_request("a/b", "t", "feat", "main", None).await?;
 client.merge_pull_request("a/b", pr.number, None, Some("squash")).await?;
 let release = client.create_release("a/b", "v1.0", None, None, false).await?;

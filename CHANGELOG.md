@@ -29,9 +29,38 @@
   `gitnapse-client` helpers (`auth_status`, `set_token`, `clear_token`)
   included. The core exposes a typed `TokenSource`/`token_source()` for this.
   (`crates/gitnapse-server`, `crates/gitnapse-client`, `../gitnapse`)
+- **Dashboard surface (all additive)**: issues detail/comments/comment/reopen
+  (`/issues/detail`, `/issues/comments`, `/issues/comment`, `/issues/reopen`),
+  users profile/repos/events/notifications + mark-read (`/users/profile`,
+  `/users/repos`, `/users/events`, `/users/notifications`,
+  `/users/notifications/read`), user/code search (`/search/users`,
+  `/search/code`), repo insights (`/repos/languages`, `/repos/contributors`)
+  and PR files/conversation (`/pulls/files`, `/pulls/conversation`). Each
+  operation has a request type + response DTO in `gitnapse-protocol`, a
+  `Backend` method in `gitnapse-server` and a typed method in
+  `gitnapse-client`. (`crates/gitnapse-protocol`, `crates/gitnapse-server`,
+  `crates/gitnapse-client`)
+- **Response enrichment**: `RepoDto` now carries `html_url`, `forks_count`,
+  `open_issues_count`, `watchers_count`, `private`, `topics`, `updated_at`,
+  `pushed_at` and `owner_avatar_url`; every actor (`IssueDto`/`Pr*Dto`,
+  reviews, comments) carries `avatar_url`; `CommitDto` gains the matched
+  GitHub `author` (login + avatar). New DTOs mirror the core models:
+  `IssueCommentDto`, `UserProfileDto`, `EventDto`, `NotificationDto`,
+  `CodeSearchResultDto`, `LanguageDto`, `ContributorDto`. New fields are
+  optional so older clients keep working under `/api/v1`.
+  (`crates/gitnapse-protocol`)
+- **HTTP coverage for the new surface**: the in-memory `FakeBackend` in
+  `routes.rs` implements every new `Backend` method and the tests exercise
+  each new route (happy path, payload decode, 400 validation and upstream
+  404/401 mapping). (`crates/gitnapse-server/src/routes.rs`)
 
 ### Changed
 
+- **Auth source value**: `GET /api/v1/auth/status` now reports the core
+  `TokenSource::label()` string (`"GITHUB_TOKEN env"`, `"OAuth session"`,
+  `"stored token"`, `"none"`) so the wire cannot drift from the core; the
+  endpoint semantics (`POST`/`DELETE`, `409` when managed by `GITHUB_TOKEN`)
+  are unchanged. (`crates/gitnapse-server`)
 - **Semantic errors**: JSON error bodies now use meaningful status codes
   (400/401/403/404/413/429/502/504) instead of always 500, and never leak
   internal error details to clients. Full causes are logged server-side.
