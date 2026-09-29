@@ -26,18 +26,22 @@ use axum::routing::{get, post};
 use base64::Engine;
 use gitnapse_protocol::{
     API_PREFIX, AuthStatusDto, CommitListRequest, CompareRequest, ContentDto, ContentRequest,
-    ErrorDto, HealthDto, IssueCreateRequest, NumberRepoRequest, PageRequest, PrCommentRequest,
+    ContributorsRequest, ErrorDto, HealthDto, IssueCommentCreateRequest, IssueCreateRequest,
+    LoginRequest, NotificationReadRequest, NumberRepoRequest, PageRequest, PrCommentRequest,
     PrCreateRequest, PrMergeRequest, PrReviewRequest, PrUpdateRequest, RateLimitDto,
     RefRepoRequest, ReleaseCreateRequest, ReleasesRequest, RepoCreateRequest, RepoRequest,
-    SearchRequest, StateRepoRequest, TokenSetRequest, TreeRequest, UserDto, WorkflowRunsRequest,
+    SearchRequest, StateRepoRequest, TokenSetRequest, TreeRequest, UserDto, UserEventsRequest,
+    UserReposRequest, WorkflowRunsRequest,
 };
 use std::sync::Arc;
 use std::time::Duration;
 use tower::{ServiceBuilder, timeout::TimeoutLayer};
 
 use crate::convert::{
-    check_run_dto, comment_dto, commits_dto, compare_dto, issue_dto, merge_dto, node_dto,
-    pr_detail_dto, pr_summary_dto, release_dto, repo_dto, review_dto, workflow_run_dto,
+    check_run_dto, code_search_result_dto, comment_dto, commits_dto, compare_dto, contributor_dto,
+    diff_files_dto, event_dto, issue_comment_dto, issue_dto, language_dto, merge_dto, node_dto,
+    notification_dto, pr_detail_dto, pr_summary_dto, release_dto, repo_dto, review_dto,
+    user_profile_dto, workflow_run_dto,
 };
 use crate::service::{Backend, error_response, task_error_response, unauthorized_response};
 use crate::webui::INDEX_HTML;
@@ -96,10 +100,16 @@ pub fn router(backend: Arc<dyn Backend>, api_token: Option<String>) -> Router {
         .route("/api/v1/workflows", get(workflows))
         // Issues
         .route("/api/v1/issues", get(issues_list).post(issues_create))
+        .route("/api/v1/issues/detail", get(issues_detail))
+        .route("/api/v1/issues/comments", get(issues_comments))
+        .route("/api/v1/issues/comment", post(issues_comment))
+        .route("/api/v1/issues/reopen", post(issues_reopen))
         .route("/api/v1/issues/close", post(issues_close))
         // Pull requests
         .route("/api/v1/pulls", get(pulls_list).post(pulls_create))
         .route("/api/v1/pulls/detail", get(pulls_detail))
+        .route("/api/v1/pulls/files", get(pulls_files))
+        .route("/api/v1/pulls/conversation", get(pulls_conversation))
         .route(
             "/api/v1/pulls/reviews",
             get(pulls_reviews).post(pulls_review),
@@ -111,6 +121,18 @@ pub fn router(backend: Arc<dyn Backend>, api_token: Option<String>) -> Router {
         .route("/api/v1/pulls/commits", get(pulls_commits))
         .route("/api/v1/pulls/merge", post(pulls_merge))
         .route("/api/v1/pulls/update", post(pulls_update))
+        // Users / profile, activity, notifications
+        .route("/api/v1/users/profile", get(user_profile))
+        .route("/api/v1/users/repos", get(user_repos))
+        .route("/api/v1/users/events", get(user_events))
+        .route("/api/v1/users/notifications", get(notifications))
+        .route("/api/v1/users/notifications/read", post(notification_read))
+        // Search
+        .route("/api/v1/search/users", get(search_users))
+        .route("/api/v1/search/code", get(search_code))
+        // Repo insights
+        .route("/api/v1/repos/languages", get(repo_languages))
+        .route("/api/v1/repos/contributors", get(repo_contributors))
         // Releases / repos
         .route("/api/v1/releases", get(releases_list).post(releases_create))
         .route("/api/v1/repos", post(repos_create))
@@ -603,6 +625,263 @@ async fn issues_close(
     .await
 }
 
+async fn issues_detail(
+    State(state): State<Arc<ServerState>>,
+    params: Result<Query<NumberRepoRequest>, QueryRejection>,
+) -> Response {
+    let Ok(Query(params)) = params else {
+        return json_bad_request("invalid query parameters");
+    };
+    if !is_valid_repo(&params.repo) || params.number == 0 {
+        return json_bad_request("repo (owner/name) and a positive number are required");
+    }
+    let (repo, number) = (params.repo, params.number);
+    let backend = state.backend.clone();
+    run_task(
+        move || backend.issue_detail(&repo, number),
+        |issue| Json(issue_dto(&issue)).into_response(),
+    )
+    .await
+}
+
+async fn issues_comments(
+    State(state): State<Arc<ServerState>>,
+    params: Result<Query<NumberRepoRequest>, QueryRejection>,
+) -> Response {
+    let Ok(Query(params)) = params else {
+        return json_bad_request("invalid query parameters");
+    };
+    if !is_valid_repo(&params.repo) || params.number == 0 {
+        return json_bad_request("repo (owner/name) and a positive number are required");
+    }
+    let (repo, number) = (params.repo, params.number);
+    let backend = state.backend.clone();
+    run_task(
+        move || backend.issue_comments(&repo, number),
+        |comments| dto_list(comments.iter().map(issue_comment_dto).collect::<Vec<_>>()),
+    )
+    .await
+}
+
+async fn issues_comment(
+    State(state): State<Arc<ServerState>>,
+    body: Result<Json<IssueCommentCreateRequest>, JsonRejection>,
+) -> Response {
+    let Ok(Json(req)) = body else {
+        return json_bad_request("invalid JSON body");
+    };
+    if !is_valid_repo(&req.repo) || req.number == 0 || req.body.trim().is_empty() {
+        return json_bad_request("repo (owner/name), number and non-empty body are required");
+    }
+    let (repo, number, comment) = (req.repo, req.number, req.body);
+    let backend = state.backend.clone();
+    run_task(
+        move || backend.create_issue_comment(&repo, number, &comment),
+        |created| (StatusCode::CREATED, Json(issue_comment_dto(&created))).into_response(),
+    )
+    .await
+}
+
+async fn issues_reopen(
+    State(state): State<Arc<ServerState>>,
+    body: Result<Json<NumberRepoRequest>, JsonRejection>,
+) -> Response {
+    let Ok(Json(req)) = body else {
+        return json_bad_request("invalid JSON body");
+    };
+    if !is_valid_repo(&req.repo) || req.number == 0 {
+        return json_bad_request("repo (owner/name) and a positive number are required");
+    }
+    let (repo, number) = (req.repo, req.number);
+    let backend = state.backend.clone();
+    run_task(
+        move || backend.reopen_issue(&repo, number),
+        |issue| Json(issue_dto(&issue)).into_response(),
+    )
+    .await
+}
+
+// ── Users / profile, activity, notifications ───────────────────────────
+
+async fn user_profile(
+    State(state): State<Arc<ServerState>>,
+    params: Result<Query<LoginRequest>, QueryRejection>,
+) -> Response {
+    let Ok(Query(params)) = params else {
+        return json_bad_request("invalid query parameters");
+    };
+    if params.login.trim().is_empty() {
+        return json_bad_request("login parameter is required");
+    }
+    let login = params.login;
+    let backend = state.backend.clone();
+    run_task(
+        move || backend.user_profile(&login),
+        |profile| Json(user_profile_dto(&profile)).into_response(),
+    )
+    .await
+}
+
+async fn user_repos(
+    State(state): State<Arc<ServerState>>,
+    params: Result<Query<UserReposRequest>, QueryRejection>,
+) -> Response {
+    let Ok(Query(params)) = params else {
+        return json_bad_request("invalid query parameters");
+    };
+    if params.login.trim().is_empty() {
+        return json_bad_request("login parameter is required");
+    }
+    let sort = params.sort.unwrap_or_else(|| "updated".to_string());
+    if !matches!(
+        sort.as_str(),
+        "created" | "updated" | "pushed" | "full_name"
+    ) {
+        return json_bad_request("sort is created|updated|pushed|full_name");
+    }
+    let login = params.login;
+    let page = params.page.unwrap_or(1).max(1);
+    let per_page = params.per_page.unwrap_or(30).clamp(1, 100);
+    let backend = state.backend.clone();
+    run_task(
+        move || backend.user_repos(&login, &sort, page, per_page),
+        |repos| dto_list(repos.iter().map(repo_dto).collect::<Vec<_>>()),
+    )
+    .await
+}
+
+async fn user_events(
+    State(state): State<Arc<ServerState>>,
+    params: Result<Query<UserEventsRequest>, QueryRejection>,
+) -> Response {
+    let Ok(Query(params)) = params else {
+        return json_bad_request("invalid query parameters");
+    };
+    if params.login.trim().is_empty() {
+        return json_bad_request("login parameter is required");
+    }
+    let login = params.login;
+    let page = params.page.unwrap_or(1).max(1);
+    let per_page = params.per_page.unwrap_or(30).clamp(1, 100);
+    let backend = state.backend.clone();
+    run_task(
+        move || backend.user_events(&login, page, per_page),
+        |events| dto_list(events.iter().map(event_dto).collect::<Vec<_>>()),
+    )
+    .await
+}
+
+async fn notifications(
+    State(state): State<Arc<ServerState>>,
+    params: Result<Query<PageRequest>, QueryRejection>,
+) -> Response {
+    let Ok(Query(params)) = params else {
+        return json_bad_request("invalid query parameters");
+    };
+    let page = params.page.unwrap_or(1).max(1);
+    let per_page = params.per_page.unwrap_or(30).clamp(1, 100);
+    let backend = state.backend.clone();
+    run_task(
+        move || backend.notifications(page, per_page),
+        |items| dto_list(items.iter().map(notification_dto).collect::<Vec<_>>()),
+    )
+    .await
+}
+
+async fn notification_read(
+    State(state): State<Arc<ServerState>>,
+    body: Result<Json<NotificationReadRequest>, JsonRejection>,
+) -> Response {
+    let Ok(Json(req)) = body else {
+        return json_bad_request("invalid JSON body");
+    };
+    if req.id.trim().is_empty() {
+        return json_bad_request("id is required");
+    }
+    let id = req.id;
+    let backend = state.backend.clone();
+    run_task(
+        move || backend.mark_notification_read(&id),
+        |()| no_content(),
+    )
+    .await
+}
+
+async fn search_users(
+    State(state): State<Arc<ServerState>>,
+    params: Result<Query<SearchRequest>, QueryRejection>,
+) -> Response {
+    let Ok(Query(params)) = params else {
+        return json_bad_request("invalid query parameters");
+    };
+    let query = params.q.unwrap_or_default();
+    let page = params.page.unwrap_or(1).max(1);
+    let per_page = params.per_page.unwrap_or(30).clamp(1, 100);
+    let backend = state.backend.clone();
+    run_task(
+        move || backend.search_users(&query, page, per_page),
+        |users| dto_list(users.iter().map(user_profile_dto).collect::<Vec<_>>()),
+    )
+    .await
+}
+
+async fn search_code(
+    State(state): State<Arc<ServerState>>,
+    params: Result<Query<SearchRequest>, QueryRejection>,
+) -> Response {
+    let Ok(Query(params)) = params else {
+        return json_bad_request("invalid query parameters");
+    };
+    let query = params.q.unwrap_or_default();
+    let page = params.page.unwrap_or(1).max(1);
+    let per_page = params.per_page.unwrap_or(30).clamp(1, 100);
+    let backend = state.backend.clone();
+    run_task(
+        move || backend.search_code(&query, page, per_page),
+        |hits| dto_list(hits.iter().map(code_search_result_dto).collect::<Vec<_>>()),
+    )
+    .await
+}
+
+async fn repo_languages(
+    State(state): State<Arc<ServerState>>,
+    params: Result<Query<RepoRequest>, QueryRejection>,
+) -> Response {
+    let Ok(Query(params)) = params else {
+        return json_bad_request("invalid query parameters");
+    };
+    if !is_valid_repo(&params.repo) {
+        return json_bad_request("repo parameter required as <owner/name>");
+    }
+    let repo = params.repo;
+    let backend = state.backend.clone();
+    run_task(
+        move || backend.languages(&repo),
+        |stats| dto_list(stats.iter().map(language_dto).collect::<Vec<_>>()),
+    )
+    .await
+}
+
+async fn repo_contributors(
+    State(state): State<Arc<ServerState>>,
+    params: Result<Query<ContributorsRequest>, QueryRejection>,
+) -> Response {
+    let Ok(Query(params)) = params else {
+        return json_bad_request("invalid query parameters");
+    };
+    if !is_valid_repo(&params.repo) {
+        return json_bad_request("repo parameter required as <owner/name>");
+    }
+    let repo = params.repo;
+    let per_page = params.per_page.unwrap_or(30).clamp(1, 100);
+    let backend = state.backend.clone();
+    run_task(
+        move || backend.contributors(&repo, per_page),
+        |people| dto_list(people.iter().map(contributor_dto).collect::<Vec<_>>()),
+    )
+    .await
+}
+
 // ── Pull requests ───────────────────────────────────────────────────────
 
 async fn pulls_list(
@@ -720,6 +999,44 @@ async fn pulls_commits(
     run_task(
         move || backend.pull_request_commits(&repo, number),
         |commits| dto_list(commits_dto(&commits)),
+    )
+    .await
+}
+
+async fn pulls_files(
+    State(state): State<Arc<ServerState>>,
+    params: Result<Query<NumberRepoRequest>, QueryRejection>,
+) -> Response {
+    let Ok(Query(params)) = params else {
+        return json_bad_request("invalid query parameters");
+    };
+    if !is_valid_repo(&params.repo) || params.number == 0 {
+        return json_bad_request("repo (owner/name) and a positive number are required");
+    }
+    let (repo, number) = (params.repo, params.number);
+    let backend = state.backend.clone();
+    run_task(
+        move || backend.pr_files(&repo, number),
+        |files| dto_list(diff_files_dto(&files)),
+    )
+    .await
+}
+
+async fn pulls_conversation(
+    State(state): State<Arc<ServerState>>,
+    params: Result<Query<NumberRepoRequest>, QueryRejection>,
+) -> Response {
+    let Ok(Query(params)) = params else {
+        return json_bad_request("invalid query parameters");
+    };
+    if !is_valid_repo(&params.repo) || params.number == 0 {
+        return json_bad_request("repo (owner/name) and a positive number are required");
+    }
+    let (repo, number) = (params.repo, params.number);
+    let backend = state.backend.clone();
+    run_task(
+        move || backend.pr_conversation(&repo, number),
+        |comments| dto_list(comments.iter().map(issue_comment_dto).collect::<Vec<_>>()),
     )
     .await
 }
@@ -888,11 +1205,13 @@ mod tests {
     use axum::http::Request;
     use gitnapse::error::GitHubError;
     use gitnapse::models::{
-        CheckRun, CommitAuthor, CommitDetails, CommitInfo, CompareResponse, DiffFile, Issue,
-        IssueLabel, IssueUser, MergeResponse, PrBranch, PullRequest, PullRequestDetail,
-        PullRequestReview, Release, RepoNode, RepoOwner, RepoSummary, ReviewComment, WorkflowRun,
+        CheckRun, CodeSearchResult, CommitAuthor, CommitDetails, CommitInfo, CompareResponse,
+        Contributor, DiffFile, Issue, IssueComment, IssueLabel, IssueUser, LanguageStat,
+        MergeResponse, Notification, PrBranch, PullRequest, PullRequestDetail, PullRequestReview,
+        Release, RepoNode, RepoOwner, RepoSummary, ReviewComment, UserEvent, UserProfile,
+        WorkflowRun,
     };
-    use gitnapse_protocol::{IssueDto, PrDetailDto, RepoDto};
+    use gitnapse_protocol::{IssueCommentDto, IssueDto, PrDetailDto, RepoDto, UserProfileDto};
     use tower::ServiceExt;
 
     #[derive(Clone, Copy, Default)]
@@ -925,8 +1244,17 @@ mod tests {
             clone_url: "https://github.com/gitnapse/gitnapse.git".into(),
             owner: RepoOwner {
                 login: "gitnapse".into(),
+                avatar_url: Some("https://avatars.example/gitnapse.png".into()),
             },
             default_branch: "main".into(),
+            html_url: Some("https://github.com/gitnapse/gitnapse".into()),
+            forks_count: Some(3),
+            open_issues_count: Some(2),
+            watchers_count: Some(42),
+            private: Some(false),
+            topics: Some(vec!["rust".into()]),
+            updated_at: Some("2026-01-02T00:00:00Z".into()),
+            pushed_at: Some("2026-01-03T00:00:00Z".into()),
         }
     }
 
@@ -996,7 +1324,7 @@ mod tests {
             }
             Ok(crate::service::TokenStatus {
                 has_token: true,
-                source: "stored",
+                source: gitnapse::auth::TokenSource::Stored.label(),
             })
         }
 
@@ -1044,6 +1372,7 @@ mod tests {
                         date: "2026-01-01T00:00:00Z".into(),
                     },
                 },
+                author: Some(user_fixture()),
             }])
         }
 
@@ -1124,6 +1453,164 @@ mod tests {
                 return Err(e);
             }
             Ok(issue_fixture(7, "closed"))
+        }
+
+        fn issue_detail(&self, _f: &str, number: u64) -> anyhow::Result<Issue> {
+            if let Some(e) = self.fail_error() {
+                return Err(e);
+            }
+            Ok(issue_fixture(number, "open"))
+        }
+
+        fn issue_comments(&self, _f: &str, _number: u64) -> anyhow::Result<Vec<IssueComment>> {
+            if let Some(e) = self.fail_error() {
+                return Err(e);
+            }
+            Ok(vec![issue_comment_fixture()])
+        }
+
+        fn create_issue_comment(
+            &self,
+            _f: &str,
+            _number: u64,
+            _body: &str,
+        ) -> anyhow::Result<IssueComment> {
+            if let Some(e) = self.fail_error() {
+                return Err(e);
+            }
+            Ok(issue_comment_fixture())
+        }
+
+        fn reopen_issue(&self, _f: &str, number: u64) -> anyhow::Result<Issue> {
+            if let Some(e) = self.fail_error() {
+                return Err(e);
+            }
+            Ok(issue_fixture(number, "open"))
+        }
+
+        fn user_profile(&self, login: &str) -> anyhow::Result<UserProfile> {
+            if let Some(e) = self.fail_error() {
+                return Err(e);
+            }
+            Ok(user_profile_fixture(login))
+        }
+
+        fn user_repos(
+            &self,
+            _login: &str,
+            _sort: &str,
+            _page: u32,
+            _per_page: u8,
+        ) -> anyhow::Result<Vec<RepoSummary>> {
+            if let Some(e) = self.fail_error() {
+                return Err(e);
+            }
+            Ok(vec![repo_summary()])
+        }
+
+        fn search_users(&self, _q: &str, _p: u32, _pp: u8) -> anyhow::Result<Vec<UserProfile>> {
+            if let Some(e) = self.fail_error() {
+                return Err(e);
+            }
+            Ok(vec![user_profile_fixture("xscriptor")])
+        }
+
+        fn search_code(&self, _q: &str, _p: u32, _pp: u8) -> anyhow::Result<Vec<CodeSearchResult>> {
+            if let Some(e) = self.fail_error() {
+                return Err(e);
+            }
+            Ok(vec![CodeSearchResult {
+                repo: "gitnapse/gitnapse".into(),
+                path: "src/main.rs".into(),
+                name: "main.rs".into(),
+                sha: "abc123".into(),
+                html_url: "https://github.com/gitnapse/gitnapse/blob/HEAD/src/main.rs".into(),
+            }])
+        }
+
+        fn user_events(&self, _login: &str, _p: u32, _pp: u8) -> anyhow::Result<Vec<UserEvent>> {
+            if let Some(e) = self.fail_error() {
+                return Err(e);
+            }
+            Ok(vec![UserEvent {
+                id: "1".into(),
+                kind: "push".into(),
+                actor: "xscriptor".into(),
+                actor_avatar_url: Some("https://avatars.example/xscriptor.png".into()),
+                repo: "gitnapse/gitnapse".into(),
+                action: None,
+                title: Some("pushed 2 commits".into()),
+                created_at: "2026-01-01T00:00:00Z".into(),
+            }])
+        }
+
+        fn notifications(&self, _p: u32, _pp: u8) -> anyhow::Result<Vec<Notification>> {
+            if let Some(e) = self.fail_error() {
+                return Err(e);
+            }
+            Ok(vec![Notification {
+                id: "42".into(),
+                unread: true,
+                reason: "mention".into(),
+                subject_type: "Issue".into(),
+                subject_title: "an issue".into(),
+                repo: Some("gitnapse/gitnapse".into()),
+                updated_at: "2026-01-01T00:00:00Z".into(),
+                html_url: Some("https://github.com/gitnapse/gitnapse/issues/7".into()),
+            }])
+        }
+
+        fn mark_notification_read(&self, _id: &str) -> anyhow::Result<()> {
+            if let Some(e) = self.fail_error() {
+                return Err(e);
+            }
+            Ok(())
+        }
+
+        fn languages(&self, _f: &str) -> anyhow::Result<Vec<LanguageStat>> {
+            if let Some(e) = self.fail_error() {
+                return Err(e);
+            }
+            Ok(vec![
+                LanguageStat {
+                    name: "Rust".into(),
+                    bytes: 900,
+                },
+                LanguageStat {
+                    name: "TypeScript".into(),
+                    bytes: 100,
+                },
+            ])
+        }
+
+        fn contributors(&self, _f: &str, _pp: u8) -> anyhow::Result<Vec<Contributor>> {
+            if let Some(e) = self.fail_error() {
+                return Err(e);
+            }
+            Ok(vec![Contributor {
+                login: "xscriptor".into(),
+                avatar_url: Some("https://avatars.example/xscriptor.png".into()),
+                contributions: 42,
+                html_url: Some("https://github.com/xscriptor".into()),
+            }])
+        }
+
+        fn pr_files(&self, _f: &str, _n: u64) -> anyhow::Result<Vec<DiffFile>> {
+            if let Some(e) = self.fail_error() {
+                return Err(e);
+            }
+            Ok(vec![DiffFile {
+                filename: "README.md".into(),
+                status: "modified".into(),
+                additions: 1,
+                deletions: 1,
+                changes: 2,
+                patch: Some("@@ -1 +1 @@".into()),
+            }])
+        }
+
+        fn pr_conversation(&self, _f: &str, _n: u64) -> anyhow::Result<Vec<IssueComment>> {
+            self.issue_comments("", 0)
         }
 
         fn pull_requests(&self, _f: &str, _s: &str, _pp: u8) -> anyhow::Result<Vec<PullRequest>> {
@@ -1305,6 +1792,35 @@ mod tests {
     fn user_fixture() -> IssueUser {
         IssueUser {
             login: "xscriptor".into(),
+            avatar_url: Some("https://avatars.example/xscriptor.png".into()),
+        }
+    }
+
+    fn user_profile_fixture(login: &str) -> UserProfile {
+        UserProfile {
+            login: login.into(),
+            name: Some("X".into()),
+            avatar_url: Some("https://avatars.example/xscriptor.png".into()),
+            bio: None,
+            company: None,
+            location: None,
+            blog: None,
+            followers: 10,
+            following: 2,
+            public_repos: 8,
+            html_url: format!("https://github.com/{login}"),
+            created_at: None,
+        }
+    }
+
+    fn issue_comment_fixture() -> IssueComment {
+        IssueComment {
+            id: 5,
+            user: user_fixture(),
+            body: "looks good".into(),
+            created_at: "2026-01-01T00:00:00Z".into(),
+            updated_at: "2026-01-01T00:00:00Z".into(),
+            html_url: "https://github.com/gitnapse/gitnapse/issues/7#issuecomment-5".into(),
         }
     }
 
@@ -1547,7 +2063,8 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let status: AuthStatusDto = serde_json::from_value(json_body(response).await).unwrap();
         assert!(status.has_token);
-        assert_eq!(status.source, "stored");
+        // The wire value is the core `TokenSource::label()` string.
+        assert_eq!(status.source, gitnapse::auth::TokenSource::Stored.label());
 
         let response = post(
             app.clone(),
@@ -1617,6 +2134,147 @@ mod tests {
         )
         .await;
         assert_eq!(response.status(), StatusCode::CREATED);
+    }
+
+    // ── Dashboard surface ───────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn dashboard_read_surface_responds() {
+        let app = test_app(Arc::new(FakeBackend::default()), None);
+        for uri in [
+            "/api/v1/issues/detail?repo=a/b&number=7",
+            "/api/v1/issues/comments?repo=a/b&number=7",
+            "/api/v1/users/profile?login=xscriptor",
+            "/api/v1/users/repos?login=xscriptor&sort=pushed&page=1&per_page=5",
+            "/api/v1/users/events?login=xscriptor",
+            "/api/v1/users/notifications?page=1&per_page=5",
+            "/api/v1/search/users?q=script",
+            "/api/v1/search/code?q=fn+main",
+            "/api/v1/repos/languages?repo=a/b",
+            "/api/v1/repos/contributors?repo=a/b",
+            "/api/v1/pulls/files?repo=a/b&number=7",
+            "/api/v1/pulls/conversation?repo=a/b&number=7",
+        ] {
+            let response = get(app.clone(), uri).await;
+            assert_eq!(response.status(), StatusCode::OK, "GET {uri}");
+        }
+    }
+
+    #[tokio::test]
+    async fn dashboard_read_payloads_decode() {
+        let app = test_app(Arc::new(FakeBackend::default()), None);
+
+        let response = get(app.clone(), "/api/v1/users/profile?login=xscriptor").await;
+        let profile: UserProfileDto = serde_json::from_value(json_body(response).await).unwrap();
+        assert_eq!(profile.login, "xscriptor");
+        assert_eq!(profile.followers, 10);
+
+        let response = get(app.clone(), "/api/v1/repos/detail?repo=a/b").await;
+        let repo: RepoDto = serde_json::from_value(json_body(response).await).unwrap();
+        assert_eq!(repo.forks_count, Some(3));
+        assert_eq!(
+            repo.owner_avatar_url.as_deref(),
+            Some("https://avatars.example/gitnapse.png")
+        );
+
+        let response = get(app, "/api/v1/issues/comments?repo=a/b&number=7").await;
+        let comments: Vec<IssueCommentDto> =
+            serde_json::from_value(json_body(response).await).unwrap();
+        assert_eq!(comments[0].id, 5);
+        assert!(comments[0].user.avatar_url.is_some());
+    }
+
+    #[tokio::test]
+    async fn issue_comment_and_reopen_mutations() {
+        let app = test_app(Arc::new(FakeBackend::default()), None);
+
+        let response = post(
+            app.clone(),
+            "/api/v1/issues/comment",
+            serde_json::json!({ "repo": "a/b", "number": 7, "body": "hello" }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let comment: IssueCommentDto = serde_json::from_value(json_body(response).await).unwrap();
+        assert_eq!(comment.id, 5);
+
+        let response = post(
+            app,
+            "/api/v1/issues/reopen",
+            serde_json::json!({ "repo": "a/b", "number": 7 }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let issue: IssueDto = serde_json::from_value(json_body(response).await).unwrap();
+        assert_eq!(issue.state, "open");
+    }
+
+    #[tokio::test]
+    async fn notification_mark_read_returns_204() {
+        let app = test_app(Arc::new(FakeBackend::default()), None);
+        let response = post(
+            app,
+            "/api/v1/users/notifications/read",
+            serde_json::json!({ "id": "42" }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn dashboard_routes_validate_inputs() {
+        let app = test_app(Arc::new(FakeBackend::default()), None);
+
+        // Empty login.
+        let response = get(app.clone(), "/api/v1/users/profile?login=").await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        // Invalid repo sort.
+        let response = get(app.clone(), "/api/v1/users/repos?login=x&sort=stars").await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        // Zero issue number.
+        let response = get(app.clone(), "/api/v1/issues/detail?repo=a/b&number=0").await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        // Empty comment body.
+        let response = post(
+            app.clone(),
+            "/api/v1/issues/comment",
+            serde_json::json!({ "repo": "a/b", "number": 7, "body": "  " }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        // Empty notification id.
+        let response = post(
+            app.clone(),
+            "/api/v1/users/notifications/read",
+            serde_json::json!({ "id": "" }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        // Missing repo for insights.
+        let response = get(app, "/api/v1/repos/languages?repo=").await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn dashboard_routes_map_upstream_errors() {
+        let not_found = Arc::new(FakeBackend {
+            fail: FailMode::NotFound,
+        });
+        let app = test_app(not_found, None);
+        let response = get(app, "/api/v1/users/profile?login=ghost").await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        let unauthorized = Arc::new(FakeBackend {
+            fail: FailMode::Unauthorized,
+        });
+        let app = test_app(unauthorized, None);
+        let response = get(app, "/api/v1/users/notifications").await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
     // ── Error contract ──────────────────────────────────────────────────

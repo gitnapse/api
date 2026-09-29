@@ -15,8 +15,10 @@ use axum::response::{IntoResponse, Response};
 use gitnapse::auth::TokenSource;
 use gitnapse::error::GitHubError;
 use gitnapse::models::{
-    CheckRun, CommitInfo, CompareResponse, Issue, MergeResponse, PullRequest, PullRequestDetail,
-    PullRequestReview, Release, RepoNode, RepoSummary, ReviewComment, WorkflowRun,
+    CheckRun, CodeSearchResult, CommitInfo, CompareResponse, Contributor, DiffFile, Issue,
+    IssueComment, LanguageStat, MergeResponse, Notification, PullRequest, PullRequestDetail,
+    PullRequestReview, Release, RepoNode, RepoSummary, ReviewComment, UserEvent, UserProfile,
+    WorkflowRun,
 };
 use gitnapse::provider::{GitProvider, ProviderKind, create_provider};
 use gitnapse_protocol::ErrorDto;
@@ -36,6 +38,7 @@ impl std::error::Error for Conflict {}
 /// Token source plus whether a token is present (never the token itself).
 pub struct TokenStatus {
     pub has_token: bool,
+    /// Human-readable [`TokenSource::label()`] (e.g. `"stored token"`).
     pub source: &'static str,
 }
 
@@ -48,6 +51,35 @@ pub trait Backend: Send + Sync {
     fn starred_repos(&self, page: u32, per_page: u8) -> anyhow::Result<Vec<RepoSummary>>;
     fn repo_by_name(&self, full_name: &str) -> anyhow::Result<RepoSummary>;
     fn rate_limit(&self) -> (Option<u32>, Option<u64>);
+
+    // ── Users / profile ──────────────────────────────────────────────────
+    fn user_profile(&self, login: &str) -> anyhow::Result<UserProfile>;
+    fn user_repos(
+        &self,
+        login: &str,
+        sort: &str,
+        page: u32,
+        per_page: u8,
+    ) -> anyhow::Result<Vec<RepoSummary>>;
+    fn search_users(
+        &self,
+        query: &str,
+        page: u32,
+        per_page: u8,
+    ) -> anyhow::Result<Vec<UserProfile>>;
+    fn search_code(
+        &self,
+        query: &str,
+        page: u32,
+        per_page: u8,
+    ) -> anyhow::Result<Vec<CodeSearchResult>>;
+    fn user_events(&self, login: &str, page: u32, per_page: u8) -> anyhow::Result<Vec<UserEvent>>;
+    fn notifications(&self, page: u32, per_page: u8) -> anyhow::Result<Vec<Notification>>;
+    fn mark_notification_read(&self, id: &str) -> anyhow::Result<()>;
+
+    // ── Repo insights ────────────────────────────────────────────────────
+    fn languages(&self, full_name: &str) -> anyhow::Result<Vec<LanguageStat>>;
+    fn contributors(&self, full_name: &str, per_page: u8) -> anyhow::Result<Vec<Contributor>>;
 
     // ── Auth management (token lifecycle) ────────────────────────────────
     /// Persist a new token (validated against GitHub) and switch to it.
@@ -80,6 +112,15 @@ pub trait Backend: Send + Sync {
 
     // ── Issues ───────────────────────────────────────────────────────────
     fn issues(&self, full_name: &str, state: &str, per_page: u8) -> anyhow::Result<Vec<Issue>>;
+    fn issue_detail(&self, full_name: &str, number: u64) -> anyhow::Result<Issue>;
+    fn issue_comments(&self, full_name: &str, number: u64) -> anyhow::Result<Vec<IssueComment>>;
+    fn create_issue_comment(
+        &self,
+        full_name: &str,
+        number: u64,
+        body: &str,
+    ) -> anyhow::Result<IssueComment>;
+    fn reopen_issue(&self, full_name: &str, number: u64) -> anyhow::Result<Issue>;
     fn create_issue(
         &self,
         full_name: &str,
@@ -112,6 +153,8 @@ pub trait Backend: Send + Sync {
     ) -> anyhow::Result<Vec<ReviewComment>>;
     fn pull_request_commits(&self, full_name: &str, number: u64)
     -> anyhow::Result<Vec<CommitInfo>>;
+    fn pr_files(&self, full_name: &str, number: u64) -> anyhow::Result<Vec<DiffFile>>;
+    fn pr_conversation(&self, full_name: &str, number: u64) -> anyhow::Result<Vec<IssueComment>>;
     fn create_pull_request(
         &self,
         full_name: &str,
@@ -222,6 +265,59 @@ impl Backend for ApiService {
         (github.rate_limit_remaining(), github.rate_limit_reset())
     }
 
+    fn user_profile(&self, login: &str) -> anyhow::Result<UserProfile> {
+        self.provider().fetch_user_profile(login)
+    }
+
+    fn user_repos(
+        &self,
+        login: &str,
+        sort: &str,
+        page: u32,
+        per_page: u8,
+    ) -> anyhow::Result<Vec<RepoSummary>> {
+        self.provider()
+            .fetch_user_repos(login, sort, page, per_page)
+    }
+
+    fn search_users(
+        &self,
+        query: &str,
+        page: u32,
+        per_page: u8,
+    ) -> anyhow::Result<Vec<UserProfile>> {
+        self.provider().search_users(query, page, per_page)
+    }
+
+    fn search_code(
+        &self,
+        query: &str,
+        page: u32,
+        per_page: u8,
+    ) -> anyhow::Result<Vec<CodeSearchResult>> {
+        self.provider().search_code(query, page, per_page)
+    }
+
+    fn user_events(&self, login: &str, page: u32, per_page: u8) -> anyhow::Result<Vec<UserEvent>> {
+        self.provider().fetch_user_events(login, page, per_page)
+    }
+
+    fn notifications(&self, page: u32, per_page: u8) -> anyhow::Result<Vec<Notification>> {
+        self.provider().fetch_notifications(page, per_page)
+    }
+
+    fn mark_notification_read(&self, id: &str) -> anyhow::Result<()> {
+        self.provider().mark_notification_read(id)
+    }
+
+    fn languages(&self, full_name: &str) -> anyhow::Result<Vec<LanguageStat>> {
+        self.provider().fetch_languages(full_name)
+    }
+
+    fn contributors(&self, full_name: &str, per_page: u8) -> anyhow::Result<Vec<Contributor>> {
+        self.provider().fetch_contributors(full_name, per_page)
+    }
+
     fn set_token(&self, token: &str) -> anyhow::Result<()> {
         let token = token.trim();
         if token.is_empty() {
@@ -263,7 +359,9 @@ impl Backend for ApiService {
     fn token_status(&self) -> anyhow::Result<TokenStatus> {
         let source = gitnapse::auth::token_source()?;
         Ok(TokenStatus {
-            has_token: source != TokenSource::None,
+            has_token: source.has_token(),
+            // The wire value is the human-readable core label, so a new
+            // `TokenSource` variant cannot silently drift from the API.
             source: source.label(),
         })
     }
@@ -311,6 +409,28 @@ impl Backend for ApiService {
 
     fn issues(&self, full_name: &str, state: &str, per_page: u8) -> anyhow::Result<Vec<Issue>> {
         self.provider().fetch_issues(full_name, state, per_page)
+    }
+
+    fn issue_detail(&self, full_name: &str, number: u64) -> anyhow::Result<Issue> {
+        self.provider().fetch_issue_detail(full_name, number)
+    }
+
+    fn issue_comments(&self, full_name: &str, number: u64) -> anyhow::Result<Vec<IssueComment>> {
+        self.provider().fetch_issue_comments(full_name, number)
+    }
+
+    fn create_issue_comment(
+        &self,
+        full_name: &str,
+        number: u64,
+        body: &str,
+    ) -> anyhow::Result<IssueComment> {
+        self.provider()
+            .create_issue_comment(full_name, number, body)
+    }
+
+    fn reopen_issue(&self, full_name: &str, number: u64) -> anyhow::Result<Issue> {
+        self.provider().reopen_issue(full_name, number)
     }
 
     fn create_issue(
@@ -369,6 +489,14 @@ impl Backend for ApiService {
     ) -> anyhow::Result<Vec<CommitInfo>> {
         self.provider()
             .fetch_pull_request_commits(full_name, number)
+    }
+
+    fn pr_files(&self, full_name: &str, number: u64) -> anyhow::Result<Vec<DiffFile>> {
+        self.provider().fetch_pr_files(full_name, number)
+    }
+
+    fn pr_conversation(&self, full_name: &str, number: u64) -> anyhow::Result<Vec<IssueComment>> {
+        self.provider().fetch_pr_conversation(full_name, number)
     }
 
     fn create_pull_request(
